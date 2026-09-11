@@ -41,3 +41,4 @@ name, rank, slug, and Letterboxd-relative link.
 
 It also detects and unwraps files saved directly from Chromium's styled
 `view-source:` page (the format containing `td.line-content` elements).
+# movie_screenshot_extractor
