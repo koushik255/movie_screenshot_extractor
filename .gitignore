@@ -1,0 +1,48 @@
+# --- Large media: never commit frames or movies ---
+movies/
+screenshots/
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+*.bmp
+*.tif
+*.tiff
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.m4v
+*.mpg
+*.mpeg
+*.wmv
+*.flv
+*.torrent
+
+# --- Generated site and pipeline data ---
+site/
+torrents.json
+torrents-cache.jsonl
+magnets.txt
+completed.txt
+pipeline-state.jsonl
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Editors / OS ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
