@@ -17,8 +17,7 @@ Writes torrents-probed.json: every input record plus `probe_alive`,
 `probe_status`, `probe_seeds`, `probe_connections`, `probe_elapsed`,
 `probe_checked`. The saved metadata is kept in
 probe-torrents/<infohash>.torrent (a ready-made local .torrent that a download
-can use to skip metadata resolution). pipeline.py and gpu_pipeline.py skip
-records whose `probe_alive` is false.
+can use to skip metadata resolution). pipeline.py skips records whose `probe_alive` is false.
 """
 
 from __future__ import annotations

@@ -44,7 +44,7 @@ It also detects and unwraps files saved directly from Chromium's styled
 
 ## Checking torrents are alive before downloading
 
-`pipeline.py` and `gpu_pipeline.py` waste a download slot (up to a full stall
+`pipeline.py` wastes a download slot (up to a full stall
 timeout) on a magnet whose swarm is unreachable. Probe first:
 
 ```bash
@@ -109,6 +109,6 @@ With `--min-seeders 4 --max-size-gb 8`, 499 of the 500 titles now have a
 magnet. The one holdout, `Princes and Princesses (2000)`, has no release on
 Pirate Bay under any title. Five titles needed `query-overrides.json`
 (alternate/original-language titles), and several older 1080p releases are
-5-8 GB, so run the GPU pipeline with `--max-size-gb 8` to include them.
+5-8 GB.
 
 # movie_screenshot_extractor

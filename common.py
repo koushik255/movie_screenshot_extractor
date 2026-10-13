@@ -1,7 +1,6 @@
-"""Helpers shared by pipeline.py, gpu_pipeline.py, probe_torrents.py and
-screenshots.py, so tracker lists, file detection and frame/state bookkeeping
-cannot drift apart between scripts. Copy this file next to gpu_pipeline.py on
-the GPU box.
+"""Helpers shared by pipeline.py, probe_torrents.py and screenshots.py, so
+tracker lists, file detection and frame/state bookkeeping cannot drift apart
+between scripts.
 """
 
 from __future__ import annotations
