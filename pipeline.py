@@ -24,7 +24,11 @@ import threading
 import time
 from pathlib import Path
 
-from screenshots import FPS, VIDEO_FILTER, frame_name, frame_total, saved_frames
+from common import (
+    BT_TRACKER_FLAG, append_state as _append_state, find_video, frame_name,
+    frames_complete, load_ranks, saved_frames, seek_arg,
+)
+from screenshots import FPS, VIDEO_FILTER, frame_total
 
 TORRENTS_JSON = Path("torrents.json")
 TORRENTS_PROBED = Path("torrents-probed.json")
@@ -41,21 +45,8 @@ EXTRACT_JOBS = 2
 # live-but-slow swarm mid-handshake (the old value of 120 caused most of the
 # "aria2c failed (exit 7)" failures). download_movie's own progress-aware
 # stall detector is the only deadline. --check-integrity verifies piece
-# hashes so a truncated file never reaches ffmpeg. Fresh trackers + a DHT
-# entry point are needed because magnets scraped from 1337x carry stale
-# tracker lists (dead coppersurfer/rarbg hosts).
-FRESH_TRACKERS = [
-    "udp://zer0day.ch:1337/announce",
-    "udp://tracker.therarbg.to:6969/announce",
-    "udp://tracker.publictracker.xyz:6969/announce",
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.demonii.com:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://tracker.qu.ax:6969/announce",
-    "udp://tracker.peerfect.org:6969/announce",
-    "udp://tracker.opentrackr.com:6969/announce",
-]
+# hashes so a truncated file never reaches ffmpeg. Fresh trackers (see
+# common.py) + a DHT entry point replace the magnets' stale tracker lists.
 ARIA2C_FLAGS = [
     "--seed-time=0",
     "--file-allocation=none",
@@ -66,12 +57,8 @@ ARIA2C_FLAGS = [
     "--allow-overwrite=true",
     "--continue=true",
     "--dht-entry-point=router.bittorrent.com:6881",
-    "--bt-tracker=" + ",".join(FRESH_TRACKERS),
+    BT_TRACKER_FLAG,
 ]
-
-MOVIE_EXTENSIONS = {
-    "mp4", "mkv", "avi", "mov", "webm", "m4v", "mpg", "mpeg", "wmv", "flv",
-}
 
 
 class Entry:
@@ -115,35 +102,16 @@ class Status:
 
 
 def load_state() -> set[int]:
-    done: set[int] = set()
-    if STATE_FILE.exists():
-        for line in STATE_FILE.read_text(encoding="utf-8").splitlines():
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get("status") == "done":
-                done.add(record["rank"])
-    return done
+    return load_ranks(STATE_FILE, "done")
 
 
 def load_skipped() -> set[int]:
     """Ranks marked skipped (e.g. dead magnet awaiting a replacement)."""
-    skipped: set[int] = set()
-    if STATE_FILE.exists():
-        for line in STATE_FILE.read_text(encoding="utf-8").splitlines():
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get("status") == "skipped":
-                skipped.add(record["rank"])
-    return skipped
+    return load_ranks(STATE_FILE, "skipped")
 
 
 def append_state(record: dict[str, object]) -> None:
-    with STATE_FILE.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _append_state(STATE_FILE, record)
 
 
 def select_entries(
@@ -194,15 +162,6 @@ def select_entries(
         entries.append(Entry(rank, title, magnet, record.get("page_url") or "Na",
                              torrent_file))
     return entries, skipped
-
-
-def largest_movie_file(directory: Path) -> Path | None:
-    candidates = [
-        path
-        for path in directory.rglob("*")
-        if path.is_file() and path.suffix.lstrip(".").lower() in MOVIE_EXTENSIONS
-    ]
-    return max(candidates, key=lambda path: path.stat().st_size, default=None)
 
 
 def download_movie(entry: Entry, status: Status, report) -> Path:
@@ -270,7 +229,7 @@ def download_movie(entry: Entry, status: Status, report) -> Path:
     process.wait()
 
     control_files = list(entry.dir.rglob("*.aria2"))
-    movie = largest_movie_file(entry.dir)
+    movie = find_video(entry.dir)
     if process.returncode != 0:
         if control_files or movie is None:
             raise RuntimeError(f"aria2c failed (exit {process.returncode})")
@@ -304,7 +263,7 @@ def extract_frames(entry: Entry, movie: Path, report) -> int:
             "-hide_banner",
             "-loglevel", "error",
             "-y",
-            "-ss", f"{start_seconds:.3}",
+            "-ss", seek_arg(start_seconds),
             "-i", str(movie),
             "-vf", VIDEO_FILTER,
             "-q:v", "5",
@@ -338,7 +297,14 @@ def extract_frames(entry: Entry, movie: Path, report) -> int:
                 f"ffmpeg failed (exit {process.returncode}){detail}"
             )
 
-    return saved_frames(out_dir)
+    final = saved_frames(out_dir)
+    if not frames_complete(final, total, FPS):
+        # ffmpeg can exit 0 on a truncated/corrupt file; never mark a partial
+        # frame set as done, or the movie is never retried.
+        raise RuntimeError(
+            f"expected {total} frames but found {final}; extraction incomplete"
+        )
+    return final
 
 
 class Pipeline:
@@ -346,7 +312,11 @@ class Pipeline:
         self.entries = entries
         self.status = Status(len(entries))
         self.download_queue: queue.Queue[Entry] = queue.Queue()
-        self.extract_queue: queue.Queue[tuple[Entry, Path]] = queue.Queue()
+        # Bounded: a download worker blocks once a finished movie is already
+        # waiting, so downloads cannot outrun extraction and fill the disk.
+        self.extract_queue: queue.Queue[tuple[Entry, Path] | None] = queue.Queue(
+            maxsize=1
+        )
         self.state_lock = threading.Lock()
         self.remaining = len(entries)
         self.finished = threading.Event()

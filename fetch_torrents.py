@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -23,9 +24,15 @@ import unicodedata
 import urllib.parse
 from pathlib import Path
 
-REPO = Path("/tmp/opencode/1337x-API")
+# /tmp is wiped on reboot, so the repo lives in the home directory by default.
+# Override with LBFIVE_1337X_API=/path/to/1337x-API.
+REPO = Path(os.environ.get("LBFIVE_1337X_API", Path.home() / "src/1337x-API"))
 if not REPO.exists():
-    print(f"error: 1337x-API repo not found at {REPO}", file=sys.stderr)
+    print(
+        f"error: 1337x-API repo not found at {REPO}; clone "
+        "https://github.com/dhimanparas20/1337x-API there or set LBFIVE_1337X_API",
+        file=sys.stderr,
+    )
     raise SystemExit(2)
 sys.path.insert(0, str(REPO))
 

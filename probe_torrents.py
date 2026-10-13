@@ -35,18 +35,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# Fresh public trackers: magnets scraped from 1337x carry stale tracker lists
-# (dead coppersurfer/rarbg hosts), so probing needs its own announce set.
-FRESH_TRACKERS = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://exodus.desync.com:6969/announce",
-    "udp://tracker.openbittorrent.com:6969/announce",
-    "udp://open.demonii.com:1337/announce",
-    "udp://tracker.tiny-vps.com:6969/announce",
-    "udp://tracker.leechers-paradise.org:6969/announce",
-]
+from common import BT_TRACKER_FLAG
 
 INFO_HASH_RE = re.compile(r"xt=urn:btih:([0-9a-zA-Z]{32,40})")
 
@@ -93,7 +82,7 @@ def probe(
         "--bt-stop-timeout=0",
         "--enable-dht=true",
         "--dht-entry-point=router.bittorrent.com:6881",
-        "--bt-tracker=" + ",".join(FRESH_TRACKERS),
+        BT_TRACKER_FLAG,
         "-d", str(target),
         magnet,
     ]

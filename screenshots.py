@@ -17,9 +17,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-MOVIE_EXTENSIONS = (
-    "mp4", "mkv", "avi", "mov", "webm", "m4v", "mpg", "mpeg", "wmv", "flv",
-)
+from common import frame_name, is_movie, saved_frames, seek_arg
 
 FPS = 2.0
 VIDEO_FILTER = "fps=2,scale='min(1280,iw)':-2"
@@ -64,10 +62,6 @@ def confirm(movies: list[Path]) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def is_movie(path: Path) -> bool:
-    return path.suffix.lstrip(".").lower() in MOVIE_EXTENSIONS
-
-
 def find_movies(directory: Path) -> list[Path]:
     if not directory.is_dir():
         raise RuntimeError(f"could not read {directory}")
@@ -105,17 +99,6 @@ def frame_total(input_path: Path) -> int:
     except (subprocess.CalledProcessError, ValueError):
         raise RuntimeError(f"could not determine duration of {input_path}")
     return int(duration * FPS + 0.999999)  # ceil
-
-
-def saved_frames(output_dir: Path) -> int:
-    frame = 1
-    while (output_dir / f"frame_{frame:06}.jpg").is_file():
-        frame += 1
-    return frame - 1
-
-
-def frame_name(frame: int) -> str:
-    return f"frame_{frame:06}.jpg"
 
 
 _print_lock = threading.Lock()
@@ -181,7 +164,7 @@ def extract_frames(input_path: Path, output_dir: Path, progress: Progress) -> No
         "-hide_banner",
         "-loglevel", "error",
         "-y",
-        "-ss", f"{start_seconds:.3}",
+        "-ss", seek_arg(start_seconds),
         "-i", str(input_path),
         "-vf", VIDEO_FILTER,
         "-q:v", "5",

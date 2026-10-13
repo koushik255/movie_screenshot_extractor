@@ -31,22 +31,10 @@ sys.path.insert(0, os.path.expanduser("~/gpu"))
 from curtain_ml import index as curtain_index  # noqa: E402
 from curtain_ml.index import CudaIndexer  # noqa: E402
 
-MOVIE_EXTENSIONS = {
-    "mp4", "mkv", "avi", "mov", "webm", "m4v", "mpg", "mpeg", "wmv", "flv",
-}
-
-# Fresh public trackers + DHT entry points: magnets scraped from 1337x carry
-# stale tracker lists that stall metadata resolution.
-FRESH_TRACKERS = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://exodus.desync.com:6969/announce",
-    "udp://tracker.openbittorrent.com:6969/announce",
-    "udp://open.demonii.com:1337/announce",
-    "udp://tracker.tiny-vps.com:6969/announce",
-    "udp://tracker.leechers-paradise.org:6969/announce",
-]
+from common import (  # noqa: E402
+    BT_TRACKER_FLAG, append_state, find_video, frame_name, frames_complete,
+    load_ranks, saved_frames, seek_arg,
+)
 
 SIZE_UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
 
@@ -68,33 +56,6 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def load_done(state: Path) -> set[int]:
-    done: set[int] = set()
-    if state.exists():
-        for line in state.read_text(encoding="utf-8").splitlines():
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get("status") == "done":
-                done.add(record["rank"])
-    return done
-
-
-def append_state(state: Path, record: dict) -> None:
-    with state.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def find_video(directory: Path) -> Path | None:
-    candidates = [
-        path
-        for path in directory.rglob("*")
-        if path.is_file() and path.suffix.lstrip(".").lower() in MOVIE_EXTENSIONS
-    ]
-    return max(candidates, key=lambda path: path.stat().st_size, default=None)
 
 
 def download(entry: dict, staging: Path, attempts: int = 2) -> Path:
@@ -124,7 +85,7 @@ def download(entry: dict, staging: Path, attempts: int = 2) -> Path:
         "--enable-dht=true",
         "--dht-entry-point=router.bittorrent.com:6881",
         "--dht-entry-point=dht.transmissionbt.com:6881",
-        "--bt-tracker=" + ",".join(FRESH_TRACKERS),
+        BT_TRACKER_FLAG,
         "-d", str(target), source,
     ]
     # Abandon a torrent that makes no progress for STALL_LIMIT, so one dead
@@ -168,7 +129,10 @@ def download(entry: dict, staging: Path, attempts: int = 2) -> Path:
         controls = list(target.rglob("*.aria2"))
         video = find_video(target)
         if stalled:
-            last = "stalled below 50 KB/s for >4 min"
+            last = (
+                f"no progress for >{STALL_LIMIT / 60:.0f} min or over the "
+                f"{OVERALL_LIMIT / 60:.0f} min cap"
+            )
         elif process.returncode != 0:
             last = f"aria2c exit {process.returncode}"
         elif controls:
@@ -182,14 +146,6 @@ def download(entry: dict, staging: Path, attempts: int = 2) -> Path:
         shutil.rmtree(target, ignore_errors=True)
         target.mkdir(parents=True, exist_ok=True)
     raise RuntimeError(last or "download failed")
-
-
-def saved_frames(shot_dir: Path) -> int:
-    """Count the contiguous run of frame_%06d.jpg files (resumable naming)."""
-    count = 0
-    while (shot_dir / f"frame_{count + 1:06d}.jpg").is_file():
-        count += 1
-    return count
 
 
 def frame_total(video: Path, sample_fps: float) -> int:
@@ -222,13 +178,13 @@ def extract_screenshots(video: Path, shot_dir: Path, sample_fps: float,
         return saved
     if saved > 0:
         # The last JPEG may be incomplete if a previous run was interrupted.
-        (shot_dir / f"frame_{saved:06d}.jpg").unlink(missing_ok=True)
+        (shot_dir / frame_name(saved)).unlink(missing_ok=True)
         saved -= 1
 
     filter_graph = f"fps={sample_fps},scale='min({width},iw)':-2"
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", f"{saved / sample_fps:.3}",
+        "-ss", seek_arg(saved / sample_fps),
         "-i", str(video),
         "-vf", filter_graph, "-q:v", str(quality),
         "-start_number", str(saved + 1),
@@ -236,7 +192,7 @@ def extract_screenshots(video: Path, shot_dir: Path, sample_fps: float,
     ]
     subprocess.run(command, stdin=subprocess.DEVNULL, check=True)
     final = saved_frames(shot_dir)
-    if final != total:
+    if not frames_complete(final, total, sample_fps):
         raise RuntimeError(
             f"expected {total} frames but found {final}; extraction incomplete"
         )
@@ -303,7 +259,7 @@ def main() -> int:
 
     records = json.loads(args.torrents.read_text(encoding="utf-8"))
     records.sort(key=lambda r: r.get("rank", 0))
-    done = load_done(state)
+    done = load_ranks(state, "done")
     only = {int(r) for r in args.only.split(",") if r.strip()} if args.only else None
 
     selected = []
