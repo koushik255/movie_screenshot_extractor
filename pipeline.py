@@ -27,6 +27,7 @@ from pathlib import Path
 from screenshots import FPS, VIDEO_FILTER, frame_name, frame_total, saved_frames
 
 TORRENTS_JSON = Path("torrents.json")
+TORRENTS_PROBED = Path("torrents-probed.json")
 STATE_FILE = Path("pipeline-state.jsonl")
 COMPLETED_LOG = Path("completed.txt")
 DOWNLOAD_ROOT = Path("movies")
@@ -35,11 +36,14 @@ SCREENSHOT_ROOT = Path("screenshots")
 DOWNLOAD_JOBS = 2
 EXTRACT_JOBS = 2
 
-# aria2c: stop seeding immediately after download; give up on a stalled
-# torrent after 120s without data so a dead slot can move on. Fresh
-# trackers + a DHT entry point are needed because magnets scraped from
-# 1337x carry stale tracker lists (dead coppersurfer/rarbg hosts), which
-# stalls metadata resolution with exit 7.
+# aria2c: stop seeding immediately after download. --bt-stop-timeout is
+# disabled because metadata exchange reports DL:0B, so aria2 would kill a
+# live-but-slow swarm mid-handshake (the old value of 120 caused most of the
+# "aria2c failed (exit 7)" failures). download_movie's own progress-aware
+# stall detector is the only deadline. --check-integrity verifies piece
+# hashes so a truncated file never reaches ffmpeg. Fresh trackers + a DHT
+# entry point are needed because magnets scraped from 1337x carry stale
+# tracker lists (dead coppersurfer/rarbg hosts).
 FRESH_TRACKERS = [
     "udp://zer0day.ch:1337/announce",
     "udp://tracker.therarbg.to:6969/announce",
@@ -57,7 +61,8 @@ ARIA2C_FLAGS = [
     "--file-allocation=none",
     "--console-log-level=warn",
     "--summary-interval=5",
-    "--bt-stop-timeout=120",
+    "--bt-stop-timeout=0",
+    "--check-integrity=true",
     "--allow-overwrite=true",
     "--continue=true",
     "--dht-entry-point=router.bittorrent.com:6881",
@@ -144,9 +149,16 @@ def append_state(record: dict[str, object]) -> None:
 def select_entries(
     limit: int, already_done: set[int], skipped_ranks: set[int]
 ) -> tuple[list[Entry], list[str]]:
-    if not TORRENTS_JSON.exists():
-        raise RuntimeError(f"{TORRENTS_JSON} not found; run fetch_torrents.py first")
-    records = json.loads(TORRENTS_JSON.read_text(encoding="utf-8"))
+    # Prefer the probe-annotated file when present: it carries probe_alive,
+    # so magnets that reached no peers are skipped instead of tying up a
+    # download slot for a full stall timeout.
+    source = TORRENTS_PROBED if TORRENTS_PROBED.exists() else TORRENTS_JSON
+    if not source.exists():
+        raise RuntimeError(
+            f"{source} not found; run fetch_torrents.py "
+            "(and optionally probe_torrents.py) first"
+        )
+    records = json.loads(source.read_text(encoding="utf-8"))
     records.sort(key=lambda r: r.get("rank", 0))
 
     entries: list[Entry] = []
@@ -162,14 +174,25 @@ def select_entries(
         if rank in already_done:
             skipped.append(f"{rank}. {title} (already screenshotted)")
             continue
+        if record.get("probe_alive") is False:
+            skipped.append(
+                f"{rank}. {title} (dead magnet: probe reached no peers; "
+                "re-run probe_torrents.py --refresh or replace it)"
+            )
+            continue
         magnet = record.get("magnet") or ""
         if magnet == "Na" or not magnet.startswith("magnet:"):
             skipped.append(f"{rank}. {title} (no magnet in torrents.json)")
             continue
-        entries.append(Entry(
-            rank, title, magnet, record.get("page_url") or "Na",
-            record.get("torrent_file") or None,
-        ))
+        # Prefer a local .torrent saved by the probe: it starts aria2c from
+        # known-good metadata, skipping the metadata handshake that stalls
+        # (and gets killed by --bt-stop-timeout) for slow swarms.
+        torrent_file = record.get("torrent_file") or None
+        probed = record.get("probe_torrent")
+        if probed and Path(probed).is_file():
+            torrent_file = probed
+        entries.append(Entry(rank, title, magnet, record.get("page_url") or "Na",
+                             torrent_file))
     return entries, skipped
 
 
@@ -204,26 +227,45 @@ def download_movie(entry: Entry, status: Status, report) -> Path:
         raise RuntimeError("aria2c not found; install it (e.g. pacman -S aria2)")
     assert process.stdout is not None
 
-    # Skip-rule: a download that crawls below MIN_DL_SPEED for longer than
-    # STALL_LIMIT is abandoned and logged; the slot moves to the next movie.
+    # Skip-rule: a download is abandoned when it makes no progress for
+    # STALL_LIMIT, or exceeds OVERALL_LIMIT outright. Progress is a *change*
+    # in the reported percentage (which advances during the metadata
+    # handshake too) or a DL rate at/above MIN_DL_SPEED - not merely the
+    # presence of a summary line, which aria2 repeats even when stalled.
     MIN_DL_SPEED = 50 * 1024  # 50 KB/s
-    STALL_LIMIT = 240.0  # 4 minutes
+    STALL_LIMIT = 300.0  # 5 minutes without progress
+    OVERALL_LIMIT = 3600.0  # hard cap: 1 hour per torrent
     speed_units = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}
-    last_active = time.monotonic()
+    started = time.monotonic()
+    last_active = started
+    last_percent = -1
     for line in process.stdout:
+        now = time.monotonic()
         match = re.search(r"\((\d+)%\)", line)
         if match:
-            report(f"{match.group(1)}%")
+            percent = int(match.group(1))
+            report(f"{percent}%")
+            if percent != last_percent:
+                last_percent = percent
+                last_active = now
         speed = re.search(r"DL:([\d.]+)([KMG]?)i?B", line)
         if speed:
             rate = float(speed.group(1)) * speed_units[speed.group(2)]
             if rate >= MIN_DL_SPEED:
-                last_active = time.monotonic()
-        if time.monotonic() - last_active > STALL_LIMIT:
+                last_active = now
+        if now - last_active > STALL_LIMIT:
             process.terminate()
             process.wait()
             raise RuntimeError(
-                "download stalled below 50 KB/s for >4 minutes; skipped"
+                f"download made no progress for >{STALL_LIMIT / 60:.0f} "
+                "minutes; skipped"
+            )
+        if now - started > OVERALL_LIMIT:
+            process.terminate()
+            process.wait()
+            raise RuntimeError(
+                f"download exceeded the {OVERALL_LIMIT / 60:.0f} minute cap; "
+                "skipped"
             )
     process.wait()
 

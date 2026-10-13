@@ -25,6 +25,9 @@ screenshots/
 site/
 torrents.json
 torrents-cache.jsonl
+torrents-probed.json
+probe-cache.jsonl
+probe-torrents/
 magnets.txt
 completed.txt
 pipeline-state.jsonl

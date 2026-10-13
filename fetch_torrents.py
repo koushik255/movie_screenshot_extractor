@@ -19,6 +19,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 import urllib.parse
 from pathlib import Path
 
@@ -181,15 +182,20 @@ class TorrentScraper:
                 for r in rows
             )
 
+        title_words = [
+            w for w in normalize(title).split()
+            if w != year and w not in {"the", "and", "for", "not"}
+        ]
+        # The full query keeps the title's word order and keeps numbers
+        # ("12", "5", "7") that distinguish films. Single-word fallbacks use
+        # only distinctive alphabetic words, longest first.
+        primary = [w for w in title_words if len(w) >= 3 or w.isdigit()]
         words = sorted(
-            {
-                w for w in normalize(title).split()
-                if len(w) >= 3 and w not in {"the", "and", "for", "not"}
-            },
+            {w for w in title_words if len(w) >= 3 and not w.isdigit()},
             key=len,
             reverse=True,
         )
-        attempts = [(" ".join(words), 1)] + [(w, max_pages) for w in words]
+        attempts = [(" ".join(primary), 1)] + [(w, max_pages) for w in words]
         seen: set[str] = set()
         for query, pages in attempts:
             for page in range(1, pages + 1):
@@ -260,26 +266,58 @@ class TorrentScraper:
 
 
 def normalize(text: str) -> str:
+    """Lowercase, fold accents, and reduce punctuation to single spaces.
+
+    Apostrophes are dropped rather than spaced so "Cuckoo's" stays one word;
+    separators such as &, :, + and · become spaces. Accents are folded first,
+    so "Cléo" becomes "cleo" instead of splitting into "cl o".
+    """
+    text = text.replace("\\", "").replace("'", "")
+    text = text.replace("&", " and ")
+    text = re.sub(r"[·•–—:+/]", " ", text)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
 def name_matches(torrent_name: str, title: str, year: str, strict: bool) -> bool:
-    """Require the torrent name to look like the actual movie."""
-    # Apostrophes first ("It's" -> "its"), then normalize to words so
-    # matching is whole-word: substring matching let 'Yi Yi' slip through
-    # as 'YIFY' and fetch the wrong torrent entirely.
-    name_words = set(normalize(torrent_name.replace("'", "")).split())
-    if year and year not in name_words:
+    """Require the torrent name to look like the actual movie.
+
+    The title's words must occur in the torrent name as an *ordered
+    subsequence*, which preserves word order and repeated words. The old
+    set-based comparison let "Sing Sing" match a name containing a single
+    "sing". Strict mode additionally requires the title to be tightly packed
+    and either distinctive (>=3 words) or near the front of the release name,
+    so a bare "Monster" no longer matches "...and Her Monster 2023" and
+    "The Return 2003" no longer matches "...The Return of the King 2003".
+    """
+    name_tokens = normalize(torrent_name).split()
+    if not name_tokens:
         return False
-    tokens = [
-        t for t in normalize(title.replace("'", "")).split() if len(t) >= 2
-    ]
-    if not tokens:
+    if year and year not in set(name_tokens):
+        return False
+
+    title_no_year = re.sub(r"\s*\(\d{4}\)\s*$", "", title)
+    wanted = [t for t in normalize(title_no_year).split() if t != year]
+    if not wanted:
+        # Title normalizes to nothing (pure punctuation); nothing to match.
         return True
-    hits = sum(1 for t in tokens if t in name_words)
-    if strict:
-        return hits == len(tokens)
-    return hits >= max(1, len(tokens) // 2)
+
+    position = 0
+    start = last = None
+    for token in wanted:
+        try:
+            index = name_tokens.index(token, position)
+        except ValueError:
+            return False
+        if start is None:
+            start = index
+        position = index + 1
+        last = index
+
+    if not strict:
+        return True
+    extra = (last - start + 1) - len(wanted)
+    return extra <= 2 and (len(wanted) >= 3 or start <= 3)
 
 
 def pick_best(
@@ -338,9 +376,29 @@ def main() -> int:
         "--output", type=Path, default=Path("torrents.json"),
         help="final JSON output file (default: torrents.json)",
     )
+    parser.add_argument(
+        "--retry-failed", action="store_true",
+        help="re-fetch cached movies whose status is not 'ok'",
+    )
+    parser.add_argument(
+        "--only", default="",
+        help="comma-separated ranks to process (e.g. 104,119)",
+    )
+    parser.add_argument(
+        "--tpb-only", action="store_true",
+        help="skip 1337x (Cloudflare-blocked) and search Pirate Bay only",
+    )
+    parser.add_argument(
+        "--overrides", type=Path, default=Path("query-overrides.json"),
+        help="JSON map of rank -> alternate/original-language query "
+             "(default: query-overrides.json)",
+    )
     args = parser.parse_args()
 
     movies = read_movies(args.movie_list)
+    if args.only:
+        wanted = {int(r) for r in args.only.split(",") if r.strip()}
+        movies = [m for m in movies if m["rank"] in wanted]
     if args.limit:
         movies = movies[: args.limit]
     if not movies:
@@ -358,12 +416,25 @@ def main() -> int:
             if isinstance(record, dict) and "rank" in record:
                 done[record["rank"]] = record
 
-    pending = [m for m in movies if m["rank"] not in done]
+    if args.retry_failed:
+        pending = [
+            m for m in movies
+            if m["rank"] not in done or done[m["rank"]].get("status") != "ok"
+        ]
+    else:
+        pending = [m for m in movies if m["rank"] not in done]
     print(
         f"{len(movies)} movies, {len(done)} already cached, {len(pending)} to go "
         f"(max {args.max_size_gb:g} GB, min {args.min_seeders} seeders)",
         flush=True,
     )
+
+    overrides: dict[str, str] = {}
+    if args.overrides.exists():
+        try:
+            overrides = json.loads(args.overrides.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            print(f"warning: ignoring malformed {args.overrides}", file=sys.stderr)
 
     scraper = TorrentScraper()
     try:
@@ -372,21 +443,35 @@ def main() -> int:
                 query = movie["title"]
                 query = urllib.parse.quote(query, safe="")
                 started = time.monotonic()
-                rows = scraper.find_matching_rows(
-                    movie["title"], movie["year"], args.category, args.max_pages
-                )
-                best, reason = pick_best(
-                    rows, max_size, args.min_seeders,
-                    movie["title"], movie["year"],
-                )
+                # An alternate/original-language title (e.g. "Los Olvidados"
+                # for "The Young and the Damned") is matched against itself,
+                # since the torrent will not contain the English words.
+                alternate = overrides.get(str(movie["rank"]), "").strip()
+                if args.tpb_only or alternate:
+                    rows: list[dict] = []
+                    best, reason = None, "no torrent matching title within size/seeders limits"
+                else:
+                    rows = scraper.find_matching_rows(
+                        movie["title"], movie["year"], args.category, args.max_pages
+                    )
+                    best, reason = pick_best(
+                        rows, max_size, args.min_seeders,
+                        movie["title"], movie["year"],
+                    )
 
                 if best is None:
-                    # 1337x came up empty: fall back to Pirate Bay, whose
-                    # search matches titles exactly and carries the magnet
-                    # directly (no detail-page visit needed). Try several
-                    # query shapes: full title, title without filler words
-                    # ("the", "movie", ...), each with and without the year.
-                    bare = " ".join(normalize(movie["title"]).split())
+                    # 1337x came up empty (or was skipped): fall back to
+                    # Pirate Bay, whose search matches titles exactly and
+                    # carries the magnet directly (no detail-page visit
+                    # needed). Try several query shapes: full title, title
+                    # without filler words ("the", "movie", ...), each with
+                    # and without the year.
+                    year = movie["year"]
+                    bare = " ".join(
+                        normalize(
+                            re.sub(r"\s*\(\d{4}\)\s*$", "", movie["title"])
+                        ).split()
+                    )
                     filler = {
                         "the", "a", "an", "of", "and", "movie", "part",
                         "from", "to", "no", "le", "la", "les", "il", "di",
@@ -395,18 +480,21 @@ def main() -> int:
                     core = " ".join(
                         w for w in bare.split() if w not in filler
                     )
-                    year = movie["year"]
-                    variants = []
+                    variants: list[tuple[str, str]] = []
+                    if alternate:
+                        variants.append(
+                            (f"{alternate} {year}".strip(), alternate)
+                        )
                     for q in (bare, core):
                         if q:
                             if year:
-                                variants.append(f"{q} {year}")
-                            variants.append(q)
-                    for query in variants:
+                                variants.append((f"{q} {year}", movie["title"]))
+                            variants.append((q, movie["title"]))
+                    for query, match_title in variants:
                         tpb_rows = scraper.tpb_search(query)
                         best, reason = pick_best(
                             tpb_rows, max_size, args.min_seeders,
-                            movie["title"], year,
+                            match_title, year,
                         )
                         if best is not None:
                             break

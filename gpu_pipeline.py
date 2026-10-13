@@ -107,43 +107,57 @@ def download(entry: dict, staging: Path, attempts: int = 2) -> Path:
             print(f"  already staged: {staged.name}", flush=True)
             return staged
     target.mkdir(parents=True, exist_ok=True)
-    source = entry.get("torrent_file") or entry["magnet"]
+    # A .torrent saved by probe_torrents.py starts aria2c from known-good
+    # metadata, skipping the metadata handshake that stalls slow swarms.
+    probed = entry.get("probe_torrent")
+    source = (
+        probed if probed and os.path.isfile(probed)
+        else entry.get("torrent_file") or entry["magnet"]
+    )
     command = [
         "aria2c", "--seed-time=0", "--file-allocation=none",
         "--console-log-level=warn", "--summary-interval=10",
-        "--bt-stop-timeout=180", "--allow-overwrite=true", "--continue=true",
+        # --bt-stop-timeout is disabled: metadata exchange reports DL:0B and
+        # would be killed as a stall. The progress-aware loop below decides.
+        "--bt-stop-timeout=0", "--check-integrity=true",
+        "--allow-overwrite=true", "--continue=true",
         "--enable-dht=true",
         "--dht-entry-point=router.bittorrent.com:6881",
         "--dht-entry-point=dht.transmissionbt.com:6881",
         "--bt-tracker=" + ",".join(FRESH_TRACKERS),
         "-d", str(target), source,
     ]
-    # Abandon a torrent that crawls below MIN_DL_SPEED for STALL_LIMIT, so one
-    # dead swarm cannot block the whole batch.
+    # Abandon a torrent that makes no progress for STALL_LIMIT, so one dead
+    # swarm cannot block the whole batch. Progress is a *change* in the
+    # reported percentage (which advances during metadata too) or a DL rate
+    # at/above MIN_DL_SPEED; aria2 repeats the same percentage when stalled.
     MIN_DL_SPEED = 50 * 1024
-    STALL_LIMIT = 240.0
+    STALL_LIMIT = 300.0
     OVERALL_LIMIT = 2400.0
     speed_units = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}
     last = None
     for attempt in range(attempts):
         started = time.monotonic()
         last_progress = started
+        last_percent = -1
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         assert process.stdout is not None
         stalled = False
         for line in process.stdout:
+            now = time.monotonic()
             speed = re.search(r"DL:([\d.]+)([KMG]?)i?B", line)
             if (
                 speed
                 and float(speed.group(1)) * speed_units[speed.group(2)]
                 >= MIN_DL_SPEED
             ):
-                last_progress = time.monotonic()
-            elif re.search(r"\((\d+)%\)", line):
-                last_progress = time.monotonic()
-            now = time.monotonic()
+                last_progress = now
+            percent = re.search(r"\((\d+)%\)", line)
+            if percent and int(percent.group(1)) != last_percent:
+                last_percent = int(percent.group(1))
+                last_progress = now
             if now - last_progress > STALL_LIMIT or now - started > OVERALL_LIMIT:
                 stalled = True
                 process.terminate()
@@ -170,20 +184,63 @@ def download(entry: dict, staging: Path, attempts: int = 2) -> Path:
     raise RuntimeError(last or "download failed")
 
 
+def saved_frames(shot_dir: Path) -> int:
+    """Count the contiguous run of frame_%06d.jpg files (resumable naming)."""
+    count = 0
+    while (shot_dir / f"frame_{count + 1:06d}.jpg").is_file():
+        count += 1
+    return count
+
+
+def frame_total(video: Path, sample_fps: float) -> int:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("ffprobe not found; is ffmpeg installed?")
+    except subprocess.CalledProcessError:
+        raise RuntimeError(f"could not determine duration of {video}")
+    total = int(float(result.stdout.strip()) * sample_fps + 0.999999)
+    if total <= 0:
+        raise RuntimeError(f"could not determine a frame count for {video}")
+    return total
+
+
 def extract_screenshots(video: Path, shot_dir: Path, sample_fps: float,
                         width: int, quality: int) -> int:
+    """Extract frames, resuming an interrupted run instead of trusting a
+    partial directory. The previous version reused any existing frame_*.jpg,
+    which silently indexed a truncated frame set after a crash."""
     shot_dir.mkdir(parents=True, exist_ok=True)
-    if any(shot_dir.glob("frame_*.jpg")):
-        print("  reusing existing screenshots", flush=True)
-        return len(list(shot_dir.glob("frame_*.jpg")))
+    total = frame_total(video, sample_fps)
+    saved = min(saved_frames(shot_dir), total)
+    if saved >= total:
+        print(f"  reusing {saved} existing screenshots", flush=True)
+        return saved
+    if saved > 0:
+        # The last JPEG may be incomplete if a previous run was interrupted.
+        (shot_dir / f"frame_{saved:06d}.jpg").unlink(missing_ok=True)
+        saved -= 1
+
     filter_graph = f"fps={sample_fps},scale='min({width},iw)':-2"
     command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{saved / sample_fps:.3}",
+        "-i", str(video),
         "-vf", filter_graph, "-q:v", str(quality),
+        "-start_number", str(saved + 1),
         str(shot_dir / "frame_%06d.jpg"),
     ]
     subprocess.run(command, stdin=subprocess.DEVNULL, check=True)
-    return len(list(shot_dir.glob("frame_*.jpg")))
+    final = saved_frames(shot_dir)
+    if final != total:
+        raise RuntimeError(
+            f"expected {total} frames but found {final}; extraction incomplete"
+        )
+    return final
 
 
 def write_collection(index_root: Path, checkpoint_sha256: str,
@@ -250,6 +307,7 @@ def main() -> int:
     only = {int(r) for r in args.only.split(",") if r.strip()} if args.only else None
 
     selected = []
+    probe_dead = 0
     for record in records:
         rank = record.get("rank")
         if rank in done:
@@ -257,6 +315,12 @@ def main() -> int:
         if only is not None and rank not in only:
             continue
         if record.get("status") != "ok":
+            continue
+        # Probe annotations are only present when --torrents points at
+        # torrents-probed.json; a magnet that reached no peers is skipped
+        # rather than stalling a download slot.
+        if record.get("probe_alive") is False:
+            probe_dead += 1
             continue
         if not str(record.get("magnet", "")).startswith("magnet:"):
             continue
@@ -273,6 +337,7 @@ def main() -> int:
     print(
         f"{len(selected)} movie(s) selected | collection={args.collection} | "
         f"checkpoint={args.checkpoint.name} ({checkpoint_sha256[:12]})"
+        + (f" | {probe_dead} dead magnet(s) skipped" if probe_dead else "")
     )
     if args.dry_run:
         for record in selected:
